@@ -530,6 +530,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 					// committed
 					if cmd1 == cmd {
 						// and it was the command we submitted.
+						// fmt.Printf("one(%v) succeeded\n", cmd)
 						return index
 					}
 				}
