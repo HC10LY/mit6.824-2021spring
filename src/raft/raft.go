@@ -18,12 +18,12 @@ package raft
 //
 
 import (
-//	"bytes"
+	"bytes"
 	"sync"
 	"sync/atomic"
 	// "fmt"
 
-//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 	"math/rand"
 	"time"
@@ -104,13 +104,15 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+
+    e.Encode(rf.currentTerm)
+    e.Encode(rf.votedFor)
+    e.Encode(rf.log)
+
+    data := w.Bytes()
+    rf.persister.SaveRaftState(data)
 }
 
 
@@ -118,22 +120,40 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
+		// 持久化数据为空，说明是第一次启动，初始化哨兵日志
+		rf.currentTerm = 0
+		rf.votedFor = -1
+		rf.log = []LogEntry{{Term: 0}} // 加哨兵日志
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		// 解码失败，防御性处理，初始化哨兵日志
+		rf.currentTerm = 0
+		rf.votedFor = -1
+		rf.log = []LogEntry{{Term: 0}} // 加哨兵日志
+		return
+	}
+
+	// 解码成功，恢复持久化的状态和日志
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = logs
+
+	// 防御性检查：如果持久化日志为空，补充哨兵日志
+	if len(rf.log) == 0 {
+		rf.log = []LogEntry{{Term: 0}}
+	}
 }
 
 
@@ -180,6 +200,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前节点的 term，用于 leader 发现自己落后
 	Success bool // 总是 true（在 2A 里）
+	ConflictIndex int // 新增为了快速回退
+	ConflictTerm  int // 同上
+	Len           int // 新增为了快速回退
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -188,6 +211,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
     reply.Term = rf.currentTerm
     reply.Success = false
+
+	reply.ConflictTerm = -1
+    reply.ConflictIndex = -1
 
     // 1. 任期检查：如果leader任期 < 当前任期，拒绝
     if args.Term < rf.currentTerm {
@@ -199,6 +225,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.currentTerm = args.Term
         rf.state = Follower
         rf.votedFor = -1
+		// 持久化
+		rf.persist()
     }
 
     // 3. 重置心跳时间戳
@@ -208,11 +236,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     if args.PrevLogIndex > 0 {
         if args.PrevLogIndex >= len(rf.log) {
             // 日志太短，没法匹配
-
+			reply.Len = len(rf.log)
             return
         }
         if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
             // 日志任期不匹配
+			// term冲突
+			conflictTerm := rf.log[args.PrevLogIndex].Term
+			reply.ConflictTerm = conflictTerm
+			// 找这个term在本地第一次出现的位置
+			i := args.PrevLogIndex
+			for rf.log[i].Term == conflictTerm {
+				i--
+			}
+			reply.ConflictIndex = i + 1
             return
         }
     }
@@ -232,9 +269,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		} else {
 			// 索引异常，返回失败
+			reply.Len = len(rf.log)
 			return
 		}
 	}
+	// 日志更新后持久化
+	rf.persist()
 
     // 6. 更新 commitIndex，取 leader 传来的 min(leaderCommit, 最后一条日志索引)
     if args.LeaderCommit > rf.commitIndex {
@@ -292,6 +332,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
+
+		rf.persist() // 持久化状态
 	}
 
 	// 判断 candidate 日志是否至少和自己一样新
@@ -309,6 +351,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.lastHeartbeat = time.Now() // 重置心跳计时，防止过早发起选举
+		rf.persist() // 持久化投票状态
 	}
 	reply.Term = rf.currentTerm
 }
@@ -426,6 +469,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 	})
 
+	rf.persist()
+
 	index := len(rf.log) - 1
 	term := rf.currentTerm
 
@@ -529,11 +574,24 @@ func (rf *Raft) sendAppendEntriesTo(peer int, term int) {
 		}
 		// fmt.Printf("[Leader %d] Updated commitIndex to %d after sending to peer %d\n", rf.me, rf.commitIndex, peer)
 	} else {
-		// 复制失败，说明日志不匹配，回退 nextIndex 以尝试找到匹配的日志
-		if rf.nextIndex[peer] > 1 {
-			rf.nextIndex[peer]--
+		// 复制失败，说明日志不匹配，使用 conflict 回退策略
+		if reply.ConflictTerm != -1 {
+			i := rf.nextIndex[peer] - 1
+			for i > 0 && rf.log[i].Term > reply.ConflictTerm {
+				i -= 1
+			}
+			if rf.log[i].Term == reply.ConflictTerm {
+				// 之前PrevLogIndex发生冲突位置时, Follower的Term自己也有
+				rf.nextIndex[peer] = i + 1
+			} else {
+				// 之前PrevLogIndex发生冲突位置时, Follower的Term自己没有
+				rf.nextIndex[peer] = reply.ConflictIndex
+			}
 		} else {
-			rf.nextIndex[peer] = 1
+			rf.nextIndex[peer] = reply.Len
+			if rf.nextIndex[peer] > len(rf.log) {
+				rf.nextIndex[peer] = len(rf.log)
+			}
 		}
 		// fmt.Printf("last fail to peer %d next [Leader %d] sendAppendEntriesTo peer %d, nextIndex=%v\n", peer, rf.me, peer, rf.nextIndex[peer])
 	}
@@ -658,6 +716,8 @@ func (rf *Raft) startElection() {
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
     votesGranted := 1  // 先给自己投票
+	rf.lastHeartbeat = time.Now() // 重置心跳时间
+	rf.persist()
 
     var mu sync.Mutex  // 保护 votesGranted 变量
     majority := len(rf.peers)/2 + 1
@@ -760,9 +820,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.lastHeartbeat = time.Now()
 
-	rf.log = append(rf.log, LogEntry{Term: 0}) // 初始有一个哨兵日志
+	// rf.log = append(rf.log, LogEntry{Term: 0}) // 初始有一个哨兵日志
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	// **这里加上初始化nextIndex和matchIndex**
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -771,9 +834,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = len(rf.log) // 一开始都设置为日志末尾的下一个位置
 		rf.matchIndex[i] = 0
 	}
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

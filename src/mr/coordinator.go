@@ -94,7 +94,7 @@ func (c *Coordinator) AssignTask(args *TaskRequestArgs, reply *TaskReply) error 
             if status == TaskIdle {
                 reply.TaskType = "Reduce"
                 reply.TaskNumber = i
-                reply.NReduce = c.nReduce
+                reply.NReduce = len(c.mapStatus)
                 reply.FileNames = nil
                 c.reduceStatus[i] = TaskInProgress
                 c.reduceStartTime[i] = time.Now()
