@@ -255,24 +255,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     }
 
     // 5. 删除冲突日志 + 追加新日志
-	for i, entry := range args.Entries {
-		idx := args.PrevLogIndex + 1 + i
-		if idx < len(rf.log) {
-			if rf.log[idx].Term != entry.Term {
-				// 冲突，删除旧日志后续并追加剩余所有新日志
-				rf.log = rf.log[:idx]
-				rf.log = append(rf.log, args.Entries[i:]...)
-				break
-			}
-		} else if idx == len(rf.log) {
-			rf.log = append(rf.log, args.Entries[i:]...)
-			break
-		} else {
-			// 索引异常，返回失败
-			reply.Len = len(rf.log)
-			return
-		}
+	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 {
+		rf.log = rf.log[:args.PrevLogIndex+1]
 	}
+
+	rf.log = append(rf.log, args.Entries...)
 	// 日志更新后持久化
 	rf.persist()
 
@@ -351,6 +338,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.lastHeartbeat = time.Now() // 重置心跳计时，防止过早发起选举
+		rf.state = Follower
 		rf.persist() // 持久化投票状态
 	}
 	reply.Term = rf.currentTerm
@@ -513,8 +501,18 @@ func (rf *Raft) sendAppendEntriesTo(peer int, term int) {
 	if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
 		prevLogTerm = rf.log[prevLogIndex].Term
 	}
-	entries := make([]LogEntry, len(rf.log[nextIndex:]))
-	copy(entries, rf.log[nextIndex:])
+
+	var entries []LogEntry
+	if len(rf.log)-1 > prevLogIndex {
+		// 如果有新的log需要发送, 则就是一个真正的AppendEntries而不是心跳
+		temp := rf.log[prevLogIndex+1:]
+		entries = make([]LogEntry, len(temp))
+		copy(entries, temp)
+	} else {
+		// 如果没有新的log发送, 就发送一个长度为0的切片, 表示心跳
+		entries = make([]LogEntry, 0)
+	}
+
 	leaderCommit := rf.commitIndex
 
 	args := AppendEntriesArgs{
@@ -542,6 +540,7 @@ func (rf *Raft) sendAppendEntriesTo(peer int, term int) {
 		rf.currentTerm = reply.Term
 		rf.state = Follower
 		rf.votedFor = -1
+		rf.persist()  // 持久化 currentTerm 和 votedFor
 		return
 	}
 
@@ -598,7 +597,7 @@ func (rf *Raft) sendAppendEntriesTo(peer int, term int) {
 }
 
 func (rf *Raft) applyLogs(applyCh chan ApplyMsg) {
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
@@ -741,10 +740,18 @@ func (rf *Raft) startElection() {
             var reply RequestVoteReply
             if rf.sendRequestVote(server, &args, &reply) {
 				rf.mu.Lock()
+
+				if args.Term != rf.currentTerm {
+					// 易错点: 函数调用的间隙被修改了
+					rf.mu.Unlock()
+					return
+				}
+
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
+					rf.persist()  // 持久化 currentTerm 和 votedFor
 					rf.mu.Unlock()
 					return
 				}
