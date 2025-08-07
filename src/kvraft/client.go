@@ -3,11 +3,17 @@ package kvraft
 import "6.824/labrpc"
 import "crypto/rand"
 import "math/big"
+import "sync"
+import "time"
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu        sync.Mutex
+	clientId  int64
+    requestId int
+    leaderId  int // 最后已知的 leader 优化查找
 }
 
 func nrand() int64 {
@@ -21,7 +27,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	return ck
+	ck.clientId = nrand()
+    ck.requestId = 1
+    ck.leaderId = 0
+    return ck
 }
 
 //
@@ -39,7 +48,30 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	ck.mu.Lock()
+	reqId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
+	args := GetArgs{
+		Key:       key,
+		ClientId:  ck.clientId,
+		RequestId: reqId,
+	}
+
+	for {
+		server := ck.leaderId
+		for i := 0; i < len(ck.servers); i++ {
+			si := (server + i) % len(ck.servers)
+			var reply GetReply
+			ok := ck.servers[si].Call("KVServer.Get", &args, &reply)
+			if ok && reply.Err != ErrWrongLeader {
+				ck.leaderId = si
+				return reply.Value
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 //
@@ -54,6 +86,32 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	reqId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClientId:  ck.clientId,
+		RequestId: reqId,
+	}
+
+	for {
+		server := ck.leaderId
+		for i := 0; i < len(ck.servers); i++ {
+			si := (server + i) % len(ck.servers)
+			var reply PutAppendReply
+			ok := ck.servers[si].Call("KVServer.PutAppend", &args, &reply)
+			if ok && reply.Err != ErrWrongLeader {
+				ck.leaderId = si
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
