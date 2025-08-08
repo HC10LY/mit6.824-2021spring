@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -53,6 +54,11 @@ type KVServer struct {
 	lastApplied map[int64]int              // 记录每个 ClientId 最后执行的 RequestId，防止重复
 	// notifyChans map[int]chan CommandResult // 用于同步等待 apply 完成，key 是日志索引
 	notifyChans sync.Map // map[int]chan CommandResult，改为sync.Map
+
+	snapshotThreshold int // 保存 maxraftstate，方便使用
+
+	// 读取快照后恢复状态需要用的字段
+	lastAppliedIndex int // 记录已应用到的最大日志索引
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -174,6 +180,8 @@ func (kv *KVServer) applier() {
 				res = CommandResult{Err: OK, ClientId: cmd.ClientId, RequestId: cmd.RequestId}
 			}
 
+			kv.lastAppliedIndex = msg.CommandIndex
+
 			kv.mu.Unlock()
 
 			if chVal, ok := kv.notifyChans.Load(msg.CommandIndex); ok {
@@ -185,6 +193,11 @@ func (kv *KVServer) applier() {
 				close(ch)
 				kv.notifyChans.Delete(msg.CommandIndex)
 			}
+
+			// 判断是否需要 snapshot
+            if kv.maxraftstate != -1 && kv.rf.RaftStateSize() > kv.maxraftstate {
+                kv.doSnapshot(kv.lastAppliedIndex)
+            }
 
 			/*
 			// 唤醒等待这个日志条目的 RPC handler
@@ -198,8 +211,51 @@ func (kv *KVServer) applier() {
 			}
 			kv.mu.Unlock()
 			*/
-		}
+		} else if msg.SnapshotValid {
+            kv.mu.Lock()
+            kv.readSnapshot(msg.Snapshot)
+            kv.lastAppliedIndex = msg.SnapshotIndex
+            kv.mu.Unlock()
+        }
 	}
+}
+
+func (kv *KVServer) doSnapshot(lastIncludedIndex int) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+
+    e.Encode(kv.kvStore)
+    e.Encode(kv.lastApplied)
+	e.Encode(kv.lastAppliedIndex)
+    data := w.Bytes()
+
+    kv.rf.Snapshot(lastIncludedIndex, data)
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+    if snapshot == nil || len(snapshot) < 1 {
+        return
+    }
+
+    r := bytes.NewBuffer(snapshot)
+    d := labgob.NewDecoder(r)
+
+    var kvStore map[string]string
+	var lastApplied map[int64]int
+	var lastAppliedIndex int
+
+	if d.Decode(&kvStore) != nil ||
+	   d.Decode(&lastApplied) != nil ||
+	   d.Decode(&lastAppliedIndex) != nil {
+		return
+	}
+
+    kv.kvStore = kvStore
+    kv.lastApplied = lastApplied
+    kv.lastAppliedIndex = lastAppliedIndex
 }
 
 //
@@ -234,6 +290,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStore = make(map[string]string)
 	kv.lastApplied = make(map[int64]int)
 	// kv.notifyChans = make(map[int]chan CommandResult)
+
+	snapshot := persister.ReadSnapshot()
+    if len(snapshot) > 0 {
+        kv.readSnapshot(snapshot)
+    }
 
 	// 启动 goroutine 监听 Raft applyCh
 	go kv.applier()

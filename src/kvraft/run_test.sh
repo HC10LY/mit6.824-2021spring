@@ -1,13 +1,13 @@
 #!/bin/bash
 
-repeat=30
+repeat=10
 
 mkdir -p logs
 
 for ((i=1; i<=repeat; i++)); do
   log_file="logs/test_run${i}.log"
   echo "Running full go test without race, iteration #$i"
-  go test -run 3A -race > "$log_file" 2>&1
+  go test -race > "$log_file" 2>&1
   if [ $? -eq 0 ]; then
     echo "  Run #$i SUCCESS"
   else
