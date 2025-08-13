@@ -8,11 +8,16 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.824/shardctrler"
-import "time"
+import (
+	"crypto/rand"
+	// "fmt"
+	"math/big"
+	"sync"
+	"time"
+
+	"6.824/labrpc"
+	"6.824/shardctrler"
+)
 
 //
 // which shard is a key in?
@@ -40,6 +45,10 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu        sync.Mutex
+	clientId int64 // 唯一客户端 ID
+    seqId    int   // 每个请求递增
+	leaderIds map[int]int   // gid -> 该组上次成功的leader服务器索引
 }
 
 //
@@ -56,6 +65,10 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.seqId = 0
+	ck.leaderIds = make(map[int]int)
+	ck.config = ck.sm.Query(-1) // 拿最新配置
 	return ck
 }
 
@@ -66,33 +79,66 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	ck.mu.Lock()
+	ck.seqId++
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+		SeqId:    ck.seqId,
+	}
+	ck.mu.Unlock()
 
 	for {
+		// fmt.Printf("client Get called key: %+v\n", args.Key)
+		ck.mu.Lock()
+		config := deepCopyConfig(ck.config)
+		ck.mu.Unlock()
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+		gid := config.Shards[shard]
+		if servers, ok := config.Groups[gid]; ok {
+			ck.mu.Lock()
+			leader := ck.leaderIds[gid]
+			ck.mu.Unlock()
+			if leader >= len(servers) {
+				leader = 0
+			}
+
+			for tried := 0; tried < len(servers); tried++ {
+				args.Shard = shard
+				args.ConfigNum = config.Num
+				// fmt.Printf("client Get called with args: %+v\n", args)
+				srv := ck.make_end(servers[leader])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					// 成功，更新leaderId
+					ck.mu.Lock()
+					ck.leaderIds[gid] = leader
+					ck.mu.Unlock()
 					return reply.Value
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
+
+				if ok && reply.Err == ErrWrongGroup {
+					// 当前组不负责这个shard，退出尝试刷新配置
+					// fmt.Printf("client Get: wrong group for key %s, gid %d\n", key, gid)
 					break
 				}
-				// ... not ok, or ErrWrongLeader
+
+				// fmt.Printf("client Get: failed to call server %s, reply: %+v\n", servers[leader], reply)
+
+				// 失败或者非leader，试下一个服务器
+				leader = (leader + 1) % len(servers)
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		newCfg := ck.sm.Query(-1)
+		ck.mu.Lock()
+		ck.config = deepCopyConfig(newCfg)
+		// fmt.Printf("client Get: updated config to %+v\n", ck.config)
+		ck.mu.Unlock()
 	}
-
-	return ""
 }
 
 //
@@ -100,32 +146,62 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	ck.mu.Lock()
+	ck.seqId++
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		SeqId:    ck.seqId,
+	}
+	ck.mu.Unlock()
 
 
 	for {
+		ck.mu.Lock()
+		config := ck.config
+		ck.mu.Unlock()
+
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+		gid := config.Shards[shard]
+		if servers, ok := config.Groups[gid]; ok {
+			ck.mu.Lock()
+			leader := ck.leaderIds[gid]
+			ck.mu.Unlock()
+			if leader >= len(servers) {
+				leader = 0
+			}
+
+			for tried := 0; tried < len(servers); tried++ {
+				args.Shard = shard
+				args.ConfigNum = config.Num
+				srv := ck.make_end(servers[leader])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+
 				if ok && reply.Err == OK {
+					// 成功，更新leaderId
+					ck.mu.Lock()
+					ck.leaderIds[gid] = leader
+					ck.mu.Unlock()
 					return
 				}
+
 				if ok && reply.Err == ErrWrongGroup {
+					// 当前组不负责这个shard，退出尝试刷新配置
 					break
 				}
-				// ... not ok, or ErrWrongLeader
+
+				// 失败或者非leader，试下一个服务器
+				leader = (leader + 1) % len(servers)
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		newCfg := ck.sm.Query(-1)
+		ck.mu.Lock()
+		ck.config = deepCopyConfig(newCfg)
+		ck.mu.Unlock()
 	}
 }
 
