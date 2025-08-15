@@ -91,7 +91,7 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	qb := new(bytes.Buffer)
 	qe := labgob.NewEncoder(qb)
 	if err := qe.Encode(args); err != nil {
-		panic(err)
+		// panic(err)
 	}
 	req.args = qb.Bytes()
 

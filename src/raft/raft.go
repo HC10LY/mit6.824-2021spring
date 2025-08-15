@@ -23,8 +23,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	// "fmt"
-
 	"math/rand"
 	"time"
 
@@ -55,6 +53,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	HeartBeatTimeOut = 101
+	ElectTimeOutBase = 450
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -79,6 +82,8 @@ type Raft struct {
     state       int
 	lastHeartbeat time.Time  // 最近一次收到有效Leader心跳的时间
 
+	heartTimer *time.Timer // 心跳定时器
+
 	log         []LogEntry  // 日志数组，从下标0开始，每个包含command和term
 	commitIndex int         // 当前已知被提交的最大日志条目索引（初始为0，单调递增）
 	lastApplied int         // 最后被应用到状态机的日志条目的索引（初始为0，单调递增）
@@ -102,6 +107,10 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
     defer rf.mu.Unlock()
     return rf.currentTerm, rf.state == Leader
+}
+
+func (rf *Raft) ResetHeartTimer(timeStamp int) {
+	rf.heartTimer.Reset(time.Duration(timeStamp) * time.Millisecond)
 }
 
 //
@@ -294,6 +303,10 @@ func (rf *Raft) persistWithSnapshot(snapshot []byte) {
     rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
+func (rf *Raft) RaftStateSize() int {
+    return rf.persister.RaftStateSize()
+}
+
 func (rf *Raft) getTermAtIndex(index int) int {
     if index == rf.lastIncludedIndex {
         return rf.lastIncludedTerm
@@ -451,7 +464,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         } else {
             rf.commitIndex = lastIndex
         }
-    }
+    } else {
+		// 如果 LeaderCommit 小于当前 commitIndex，说明已经过期
+		rf.commitIndex = args.LeaderCommit
+	}
+	// fmt.Printf("[Follower %d] AppendEntries: rf.commitIndex=%d, rf.lastIncludedIndex=%d, rf.log.len=%d, [leader %d].LeaderCommit=%d\n", rf.me, rf.commitIndex, rf.lastIncludedIndex, len(rf.log), args.LeaderId, args.LeaderCommit)
 	// fmt.Printf("[Follower %d] AppendEntries success=%v, commitIndex=%v\n", rf.me, reply.Success, rf.commitIndex)
 
     reply.Success = true
@@ -685,7 +702,13 @@ func (rf *Raft) sendPreVote(server int, args *PreVoteArgs, reply *PreVoteReply) 
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	// defer rf.mu.Unlock()
+
+	defer func() {
+		// DPrintf("server %v Start 释放锁mu", rf.me)
+		rf.ResetHeartTimer(10)
+		rf.mu.Unlock()
+	}()
 
 	if rf.state != Leader {
 		return -1, rf.currentTerm, false
@@ -1007,6 +1030,7 @@ func (rf *Raft) ticker() {
 
         if rf.state != Leader && timeSinceLastHeartbeat >= electionTimeout {
             // 进行预投票，成功才真正发起选举
+			// fmt.Printf("follower %d start election\n", rf.me)
             rf.startElection()
         }
         rf.mu.Unlock()
@@ -1062,6 +1086,9 @@ func (rf *Raft) startElection() {
     rf.state = Candidate
     rf.currentTerm++
     rf.votedFor = rf.me
+	votesGranted := 1
+	rf.lastHeartbeat = time.Now() // 重置心跳时间
+	rf.persist()
 
 	var lastLogIndex int
     if len(rf.log) == 0 {
@@ -1081,9 +1108,9 @@ func (rf *Raft) startElection() {
 
 	// lastLogIndex := len(rf.log) - 1
 	// lastLogTerm := rf.log[lastLogIndex].Term
-    votesGranted := 1  // 先给自己投票
-	rf.lastHeartbeat = time.Now() // 重置心跳时间
-	rf.persist()
+    // votesGranted := 1  // 先给自己投票
+	// rf.lastHeartbeat = time.Now() // 重置心跳时间
+	// rf.persist()
 
     var mu sync.Mutex  // 保护 votesGranted 变量
     majority := len(rf.peers)/2 + 1
@@ -1156,6 +1183,7 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) leaderSendHeartbeats() {
 	for {
+		<-rf.heartTimer.C
 		rf.mu.Lock()
 		if rf.killed() || rf.state != Leader {
 			rf.mu.Unlock()
@@ -1173,7 +1201,8 @@ func (rf *Raft) leaderSendHeartbeats() {
 			go rf.sendAppendEntriesTo(peer, term)
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		// time.Sleep(100 * time.Millisecond)
+		rf.ResetHeartTimer(HeartBeatTimeOut)
 	}
 }
 
@@ -1203,6 +1232,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.lastHeartbeat = time.Now()
 
+	rf.heartTimer = time.NewTimer(0)
+
 	// rf.log = append(rf.log, LogEntry{Term: 0}) // 初始有一个哨兵日志
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -1229,4 +1260,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.applyLogs(rf.applyCh)
 
 	return rf
+}
+
+
+// 在 Raft 里加
+func (rf *Raft) GetLastLogTerm() int {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    return rf.getLastLogTermUnlocked()
+}
+
+func (rf *Raft) getLastLogTermUnlocked() int {
+    if len(rf.log) > 0 {
+        return rf.log[len(rf.log)-1].Term
+    }
+    return rf.lastIncludedTerm
 }

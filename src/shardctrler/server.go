@@ -151,12 +151,14 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	reply.WrongLeader = false
 	reply.Err = OK
 
+	sc.mu.Lock()
 	// If Query num is -1 or > last, return latest
 	if args.Num == -1 || args.Num >= len(sc.configs) {
 		reply.Config = sc.copyConfig(sc.configs[len(sc.configs)-1])
 	} else {
 		reply.Config = sc.copyConfig(sc.configs[args.Num])
 	}
+	sc.mu.Unlock()
 	_ = res
 }
 
